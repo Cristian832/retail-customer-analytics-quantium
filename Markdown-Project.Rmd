@@ -1,0 +1,213 @@
+---
+title: "Project Quantium"
+author: "Cristian Torres"
+date: "2025-12-25"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=TRUE}
+ #install.packages("tidyverse")
+ #install.packages("readxl")
+ #install.packages("lubridate")
+ #install.packages("knitr")
+ #install.packages("ggplot2")
+
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(knitr)
+library(ggplot2)
+
+setwd("C:/Users/Cristian/Downloads/Project Quantium")
+```
+Loading all librarys
+
+```{r ingesting, include=TRUE}
+transactions <- read_excel("QVI_transaction_data.xlsx")
+customers <- read_csv("QVI_purchase_behaviour.csv")
+```
+
+#### summarization & exploratory analysis
+```{r datachecks, include=TRUE}
+dim(transactions); str(transactions)
+dim(customers); str(customers)
+dim(customers); str(customers)
+
+summary(transactions)
+summary(customers)
+
+
+```
+#cleaning step to align dataset & feature engineering
+```{r datacleaningdate, include=TRUE}
+transactions <- transactions %>%
+mutate(DATE = as.Date(DATE, origin = "1899-12-30"))
+
+```
+verification of the columns 
+
+```{r verifications columns, include=TRUE}
+colSums(is.na(transactions))
+colSums(is.na(customers))
+```
+Here can able to see if the common outliers for the dataset who can have distortion of the reality and the analysis
+```{r Outliers detection, include=TRUE}
+summary(transactions$PROD_QTY)
+
+summary(transactions$TOT_SALES)
+```
+filtering data set to remove outlier
+```{r cleaning and filtering, include=TRUE}
+transactions <- transactions %>%
+  filter(PROD_QTY < 200)
+```
+
+```{r enginering, include=TRUE}
+transactions <- transactions %>%
+  mutate(PACK_SIZE = as.numeric(str_extract(PROD_NAME, "\\d+")))
+
+summary(transactions$PACK_SIZE)
+
+transactions <- transactions %>%
+  mutate(BRAND = word(PROD_NAME, 1))
+
+transactions <- transactions %>%
+  mutate(BRAND = case_when(
+    BRAND == "Red" ~ "Red Rock Deli",
+    BRAND == "GrnWves" ~ "Grain Waves",
+    BRAND == "Infzns" ~ "Infuzions",
+    BRAND == "Smith" ~ "Smiths",
+    BRAND == "Dorito" ~ "Doritos",
+    BRAND == "WW" ~ "Woolworths",
+    TRUE ~ BRAND
+  ))
+```
+
+```{r segmentation  of customers , include=TRUE}
+data_full <- transactions %>%
+  left_join(customers, by = "LYLTY_CARD_NBR")
+
+colSums(is.na(data_full))
+
+customer_metrics <- data_full %>%
+  group_by(LYLTY_CARD_NBR, LIFESTAGE, PREMIUM_CUSTOMER) %>%
+  summarise(
+    total_sales = sum(TOT_SALES),
+    total_qty = sum(PROD_QTY),
+    transactions = n(),
+    avg_price_per_unit = total_sales / total_qty,
+    .groups = "drop"
+  )
+summary(customer_metrics)
+```
+
+```{r fig.width = 10, fig.align = "center"}
+ggplot(transactions, aes(x = PACK_SIZE)) +
+  geom_histogram(binwidth = 10, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Chip Pack Sizes",
+    x = "Pack Size (in grams)",
+    y = "Number of Transactions"
+  ) +
+  theme_minimal()
+
+print(
+  ggplot(transactions, aes(x = PACK_SIZE)) +
+    geom_histogram(binwidth = 10, fill = "steelblue", color = "white") +
+    theme_minimal()
+)
+
+str(transactions$PACK_SIZE)
+```
+
+```{r avg products, include=TRUE}
+avg_products_customer <- transactions %>%
+  left_join(customers, by = "LYLTY_CARD_NBR") %>%
+  group_by(LYLTY_CARD_NBR, LIFESTAGE, PREMIUM_CUSTOMER) %>%
+  summarise(
+    total_products = sum(PROD_QTY),
+    .groups = "drop"
+  ) %>%
+  group_by(LIFESTAGE, PREMIUM_CUSTOMER) %>%
+  summarise(
+    avg_products = mean(total_products),
+    .groups = "drop"
+  )
+
+ggplot(avg_products_customer,
+       aes(x = LIFESTAGE, y = avg_products, fill = PREMIUM_CUSTOMER)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Average Number of Products per Customer",
+    x = "Lifestage",
+    y = "Average Products Purchased",
+    fill = "Customer Type"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+```{r difference statistical , include=TRUE}
+customer_level <- transactions %>%
+  left_join(customers, by = "LYLTY_CARD_NBR") %>%
+  group_by(LYLTY_CARD_NBR, PREMIUM_CUSTOMER) %>%
+  summarise(
+    total_products = sum(PROD_QTY),
+    .groups = "drop"
+  )
+
+premium_products <- customer_level %>%
+  filter(PREMIUM_CUSTOMER == "Premium") %>%
+  pull(total_products)
+
+non_premium_products <- customer_level %>%
+  filter(PREMIUM_CUSTOMER != "Premium") %>%
+  pull(total_products)
+
+t_test_result <- t.test(
+  premium_products,
+  non_premium_products
+)
+
+t_test_result
+# p-value = 0.02985
+```
+
+```{r affluence-effect-plot, echo=TRUE, message=FALSE, warning=FALSE}
+
+data_full <- transactions %>%
+  left_join(customers, by = "LYLTY_CARD_NBR")
+
+
+affluence_metrics <- data_full %>%
+  group_by(LIFESTAGE, PREMIUM_CUSTOMER) %>%
+  summarise(
+    total_sales = sum(TOT_SALES),
+    total_qty   = sum(PROD_QTY),
+    n_txn       = n(),
+    avg_packs_per_txn = total_qty / n_txn,
+    avg_unit_price    = total_sales / total_qty,
+    .groups = "drop"
+  )
+
+
+ggplot(affluence_metrics,
+       aes(x = avg_unit_price,
+           y = avg_packs_per_txn,
+           size = total_sales,
+           color = PREMIUM_CUSTOMER)) +
+  geom_point(alpha = 0.85) +
+  facet_wrap(~ LIFESTAGE) +
+  labs(
+    title = "Affluence (Premium Customer) and its Effect on Chip Buying Behaviour",
+    x = "Average Unit Price (Sales per Pack)",
+    y = "Average Packs per Transaction",
+    size = "Total Sales",
+    color = "Affluence"
+  ) +
+  theme_minimal()
+```

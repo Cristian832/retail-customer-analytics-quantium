@@ -1,0 +1,317 @@
+---
+title: "Task-2-measureimpact"
+author: "Cristian Torres"
+date: "2025-12-25"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=TRUE}
+ #install.packages("tidyverse")
+ #install.packages("readxl")
+ #install.packages("lubridate")
+ #install.packages("knitr")
+ #install.packages("ggplot2")
+
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(knitr)
+library(ggplot2)
+
+setwd("C:/Users/Cristian/Downloads/Project Quantium")
+```
+
+```{r ingesting, include=FALSE}
+transactions <- read_excel("QVI_transaction_data.xlsx") %>%
+mutate(DATE = as.Date(DATE, origin = "1899-12-30"))
+
+customers <- read_csv("QVI_purchase_behaviour.csv", show_col_types = FALSE)
+dat <- transactions %>%
+left_join(customers, by = "LYLTY_CARD_NBR")
+```
+Here we segment the data to future use
+```{r unnamed, include=FALSE}
+dat_m <- dat %>%
+mutate(YEARMONTH = floor_date(DATE, "month")) %>%
+group_by(STORE_NBR, YEARMONTH) %>%
+summarise(
+total_sales = sum(TOT_SALES, na.rm = TRUE),
+n_customers = n_distinct(LYLTY_CARD_NBR),
+n_txns = n_distinct(TXN_ID),
+.groups = "drop"
+) %>%
+mutate(txn_per_cust = if_else(n_customers > 0, n_txns / n_customers, NA_real_))
+
+dat_m %>% arrange(STORE_NBR, YEARMONTH) %>% head(12)
+```
+Separation of seasons (trial and not trial) using vector
+```{r trialssegmentation, include=TRUE}
+
+trial_stores <- c(77, 86, 88)
+
+pre_start <- ymd("2018-02-01")
+pre_end <- ymd("2019-01-01")
+
+trial_start <- ymd("2019-02-01")
+trial_end <- ymd("2019-04-01")
+```
+Control in correlation based in start and end trial to sales and customers 
+```{r control_store, include=FALSE}
+
+pre_only <- function(df) {
+df %>% filter(YEARMONTH >= pre_start, YEARMONTH <= pre_end)
+}
+
+get_pair_pre <- function(df, trial_store, candidate_store) {
+a <- pre_only(df) %>% filter(STORE_NBR == trial_store) %>% arrange(YEARMONTH)
+b <- pre_only(df) %>% filter(STORE_NBR == candidate_store) %>% arrange(YEARMONTH)
+if (nrow(a) == 0 || nrow(b) == 0) return(NULL)
+if (!all(a$YEARMONTH == b$YEARMONTH)) return(NULL)
+list(a = a, b = b)
+}
+
+score_controls <- function(df, trial_store, exclude = trial_stores) {
+candidates <- setdiff(unique(df$STORE_NBR), exclude)
+
+raw <- map_dfr(candidates, function(cs) {
+pair <- get_pair_pre(df, trial_store, cs)
+if (is.null(pair)) return(NULL)
+a <- pair$a; b <- pair$b
+
+tibble(
+  trial_store = trial_store,
+  control_store = cs,
+  cor_sales = suppressWarnings(cor(a$total_sales, b$total_sales, use="complete.obs")),
+  cor_cust  = suppressWarnings(cor(a$n_customers, b$n_customers, use="complete.obs")),
+  dist_sales = mean(abs(a$total_sales - b$total_sales), na.rm = TRUE),
+  dist_cust  = mean(abs(a$n_customers - b$n_customers), na.rm = TRUE)
+)
+
+})
+raw %>%
+mutate(
+mag_sales = 1 - (dist_sales - min(dist_sales)) / (max(dist_sales) - min(dist_sales)),
+mag_cust = 1 - (dist_cust - min(dist_cust )) / (max(dist_cust ) - min(dist_cust )),
+total_score = rowMeans(cbind(cor_sales, cor_cust, mag_sales, mag_cust), na.rm = TRUE)
+) %>%
+arrange(desc(total_score))
+}
+
+pick_best_control <- function(df, trial_store) {
+score_controls(df, trial_store) %>% slice(1)
+}
+controls <- map_dfr(trial_stores, ~pick_best_control(dat_m, .x))
+controls
+```
+Scale control by stores in monthly
+```{r next_segmentation_scale_control, include=TRUE}
+
+make_series <- function(df, trial_store, control_store) {
+
+  t <- df %>% dplyr::filter(STORE_NBR == trial_store)
+  c <- df %>% dplyr::filter(STORE_NBR == control_store)
+
+  t_pre <- t %>% dplyr::filter(YEARMONTH >= pre_start, YEARMONTH <= pre_end)
+  c_pre <- c %>% dplyr::filter(YEARMONTH >= pre_start, YEARMONTH <= pre_end)
+
+
+  sf_sales <- sum(t_pre$total_sales, na.rm = TRUE) / sum(c_pre$total_sales, na.rm = TRUE)
+  sf_cust  <- sum(t_pre$n_customers, na.rm = TRUE) / sum(c_pre$n_customers, na.rm = TRUE)
+  sf_txpc  <- mean(t_pre$txn_per_cust, na.rm = TRUE) / mean(c_pre$txn_per_cust, na.rm = TRUE)
+
+  s <- dplyr::full_join(
+    t %>%
+      dplyr::select(YEARMONTH, total_sales, n_customers, txn_per_cust) %>%
+      dplyr::rename_with(~paste0("trial_", .x), -YEARMONTH),
+    c %>%
+      dplyr::select(YEARMONTH, total_sales, n_customers, txn_per_cust) %>%
+      dplyr::rename_with(~paste0("ctrl_", .x), -YEARMONTH),
+    by = "YEARMONTH"
+  ) %>%
+    dplyr::arrange(YEARMONTH) %>%
+    dplyr::mutate(
+      scaled_ctrl_sales = ctrl_total_sales * sf_sales,
+      scaled_ctrl_cust  = ctrl_n_customers * sf_cust,
+      scaled_ctrl_txpc  = ctrl_txn_per_cust * sf_txpc
+    )
+
+  s
+}
+
+sig_test_ci <- function(series, metric_trial, metric_scaled_ctrl) {
+  pre_idx   <- series$YEARMONTH >= pre_start & series$YEARMONTH <= pre_end
+  trial_idx <- series$YEARMONTH >= trial_start & series$YEARMONTH <= trial_end
+
+  diff_pre <- (series[[metric_trial]] - series[[metric_scaled_ctrl]])[pre_idx]
+  mu <- mean(diff_pre, na.rm = TRUE)
+  sd_pre <- sd(diff_pre, na.rm = TRUE)
+
+  upper <- mu + 1.96 * sd_pre
+  lower <- mu - 1.96 * sd_pre
+
+  diff_trial <- (series[[metric_trial]] - series[[metric_scaled_ctrl]])[trial_idx]
+
+  tibble::tibble(
+    mean_pre_diff = mu,
+    sd_pre_diff = sd_pre,
+    ci_lower = lower,
+    ci_upper = upper,
+    trial_months_all_above_upper = all(diff_trial > upper, na.rm = TRUE)
+  )
+}
+
+uplift_pct <- function(series, metric_trial, metric_scaled_ctrl) {
+  trial_idx <- series$YEARMONTH >= trial_start & series$YEARMONTH <= trial_end
+
+  t_sum <- sum(series[[metric_trial]][trial_idx], na.rm = TRUE)
+  c_sum <- sum(series[[metric_scaled_ctrl]][trial_idx], na.rm = TRUE)
+
+  (t_sum - c_sum) / c_sum
+}
+
+plot_metric <- function(series, title, ylab, trial_col, ctrl_col) {
+  series %>%
+    dplyr::select(YEARMONTH, trial = dplyr::all_of(trial_col), control = dplyr::all_of(ctrl_col)) %>%
+    tidyr::pivot_longer(-YEARMONTH, names_to = "Series", values_to = "Value") %>%
+    ggplot2::ggplot(ggplot2::aes(YEARMONTH, Value, color = Series)) +
+    ggplot2::geom_line(linewidth = 1) +
+    ggplot2::geom_vline(xintercept = trial_start, linetype = "dashed") +
+    ggplot2::geom_vline(xintercept = trial_end, linetype = "dashed") +
+    ggplot2::labs(title = title, x = "Month", y = ylab)
+}
+results <- purrr::pmap_dfr(
+controls %>% dplyr::select(trial_store, control_store),
+function(trial_store, control_store) {
+
+s <- make_series(dat_m, trial_store, control_store)
+
+sig_sales <- sig_test_ci(s, "trial_total_sales", "scaled_ctrl_sales")
+sig_cust  <- sig_test_ci(s, "trial_n_customers", "scaled_ctrl_cust")
+sig_txpc  <- sig_test_ci(s, "trial_txn_per_cust", "scaled_ctrl_txpc")
+
+tibble::tibble(
+  trial_store   = trial_store,
+  control_store = control_store,
+
+  sales_uplift_pct = uplift_pct(s, "trial_total_sales", "scaled_ctrl_sales"),
+  cust_uplift_pct  = uplift_pct(s, "trial_n_customers", "scaled_ctrl_cust"),
+  txpc_uplift_pct  = uplift_pct(s, "trial_txn_per_cust", "scaled_ctrl_txpc"),
+
+  sales_sig = sig_sales$trial_months_all_above_upper,
+  cust_sig  = sig_cust$trial_months_all_above_upper,
+  txpc_sig  = sig_txpc$trial_months_all_above_upper
+)
+
+}
+)
+
+results
+```
+Visualization supports labels and functions
+```{r viz, include=TRUE}
+plot_metric <- function(series, title, ylab, trial_col, ctrl_col) {
+  series %>%
+    dplyr::select(YEARMONTH, trial = dplyr::all_of(trial_col), control = dplyr::all_of(ctrl_col)) %>%
+    tidyr::pivot_longer(-YEARMONTH, names_to = "Series", values_to = "Value") %>%
+    ggplot2::ggplot(ggplot2::aes(YEARMONTH, Value, color = Series)) +
+    ggplot2::geom_line(linewidth = 1) +
+    ggplot2::geom_vline(xintercept = trial_start, linetype = "dashed") +
+    ggplot2::geom_vline(xintercept = trial_end, linetype = "dashed") +
+    ggplot2::labs(title = title, x = "Month", y = ylab)
+}
+
+plot_diff_ci <- function(series, metric_trial, metric_scaled_ctrl, title, ylab) {
+  pre_idx   <- series$YEARMONTH >= pre_start & series$YEARMONTH <= pre_end
+  diff_pre  <- (series[[metric_trial]] - series[[metric_scaled_ctrl]])[pre_idx]
+  mu <- mean(diff_pre, na.rm = TRUE)
+  sd_pre <- sd(diff_pre, na.rm = TRUE)
+  upper <- mu + 1.96 * sd_pre
+  lower <- mu - 1.96 * sd_pre
+
+  dfp <- tibble::tibble(
+    YEARMONTH = series$YEARMONTH,
+    diff = series[[metric_trial]] - series[[metric_scaled_ctrl]],
+    ci_lower = lower,
+    ci_upper = upper
+  )
+
+  ggplot2::ggplot(dfp, ggplot2::aes(YEARMONTH, diff)) +
+    ggplot2::geom_line(linewidth = 1) +
+    ggplot2::geom_hline(yintercept = upper, linetype = "dashed") +
+    ggplot2::geom_hline(yintercept = lower, linetype = "dashed") +
+    ggplot2::geom_vline(xintercept = trial_start, linetype = "dashed") +
+    ggplot2::geom_vline(xintercept = trial_end, linetype = "dashed") +
+    ggplot2::labs(title = title, x = "Month", y = ylab)
+}
+```
+Viz deployed
+```{r viz_show, include=TRUE, echo=FALSE, fig.width=10, fig.height=4}
+purrr::pwalk(
+  controls %>% dplyr::select(trial_store, control_store),
+  function(trial_store, control_store) {
+
+    s <- make_series(dat_m, trial_store, control_store)
+
+    p_sales <- plot_metric(
+      s,
+      paste0("Total Sales | Trial ", trial_store, " vs Scaled Control ", control_store),
+      "Total Sales",
+      "trial_total_sales",
+      "scaled_ctrl_sales"
+    )
+
+    p_cust <- plot_metric(
+      s,
+      paste0("Customers | Trial ", trial_store, " vs Scaled Control ", control_store),
+      "Customers",
+      "trial_n_customers",
+      "scaled_ctrl_cust"
+    )
+
+    p_txpc <- plot_metric(
+      s,
+      paste0("Txn per Customer | Trial ", trial_store, " vs Scaled Control ", control_store),
+      "Txn per Customer",
+      "trial_txn_per_cust",
+      "scaled_ctrl_txpc"
+    )
+
+    p_sales_ci <- plot_diff_ci(
+      s,
+      "trial_total_sales",
+      "scaled_ctrl_sales",
+      paste0("Sales Diff (Trial - Scaled Control) + 95% CI | Store ", trial_store),
+      "Sales Difference"
+    )
+
+    # IMPORTANTE: print() para que knitr lo renderice en HTML/PDF
+    print(p_sales)
+    print(p_cust)
+    print(p_txpc)
+    print(p_sales_ci)
+  }
+)
+```
+
+```{r viz_show2, include=TRUE, echo=FALSE, fig.width=10, fig.height=4}
+ts <- controls$trial_store[1]
+cs <- controls$control_store[1]
+
+s <- make_series(dat_m, ts, cs)
+
+line_plot <- s %>%
+  dplyr::filter(YEARMONTH >= pre_start, YEARMONTH <= pre_end) %>%
+  dplyr::select(YEARMONTH, Trial = trial_total_sales, Control = scaled_ctrl_sales) %>%
+  tidyr::pivot_longer(-YEARMONTH, names_to = "Series", values_to = "Sales") %>%
+  ggplot2::ggplot(ggplot2::aes(x = YEARMONTH, y = Sales, color = Series)) +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::labs(
+    title = paste0("Pre-Trial Alignment (Sales): Trial ", ts, " vs Control ", cs),
+    x = "Month",
+    y = "Total Sales"
+  )
+
+print(line_plot)
+```
